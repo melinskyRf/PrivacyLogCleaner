@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="PrivacyLogCleaner/PrivacyLogCleaner.vcxproj" Id="5b75755d-f8fb-4ca1-bf69-5997db46ccae" />
+</Solution>

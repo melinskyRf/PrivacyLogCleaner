@@ -1,0 +1,845 @@
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <map>
+#include <set>
+#include <memory>
+#include <algorithm>
+#include <cctype>
+#include <iomanip>
+#include <chrono>
+#include <filesystem>
+#include <system_error>
+#include <regex>
+#include <ShlObj.h>
+#include <UserEnv.h>
+
+namespace fs = std::filesystem;
+using namespace std::chrono;
+
+// ============================================================================
+// Configurações globais
+// ============================================================================
+struct Config {
+    bool verbose = true;                    // Mostrar detalhes na tela
+    int maxRecursionDepth = 3;               // Profundidade máxima de recursão
+    uintmax_t maxFileSize = 50 * 1024 * 1024; // 50MB max
+    
+    // Extensões seguras para remover (logs e caches)
+    std::set<std::string> allowedExtensions = {
+        ".log", ".tmp", ".crdownload", ".part", ".lnk", ".url",
+        ".sqlite", ".dat", ".etl", ".blf", ".regtrans-ms",
+        ".evtx", ".etl", ".wpv", ".txt", ".csv", ".json"
+    };
+    
+    // Extensões que NUNCA devem ser removidas
+    std::set<std::string> blockedExtensions = {
+        ".exe", ".dll", ".sys", ".drv", ".ini", ".inf", ".cat",
+        ".msi", ".msp", ".ocx", ".cpl", ".scr", ".com", ".bat",
+        ".cmd", ".ps1", ".vbs", ".js", ".jar", ".class", ".bin"
+    };
+    
+    // Paths protegidos - NUNCA acessar
+    std::vector<std::string> protectedPaths = {
+        "C:\\Windows\\System32",
+        "C:\\Windows\\SysWOW64",
+        "C:\\Program Files",
+        "C:\\Program Files (x86)",
+        "C:\\Windows\\WinSxS",
+        "C:\\Windows\\assembly",
+        "C:\\Windows\\Microsoft.NET",
+        "C:\\Windows\\Installer",
+        "C:\\Windows\\Servicing",
+        "C:\\Windows\\Logs\\CBS",
+        "C:\\Windows\\Logs\\DISM",
+        "C:\\Windows\\Debug",
+        "C:\\Windows\\System32\\config",
+        "C:\\Windows\\System32\\drivers",
+        "C:\\Windows\\System32\\DriverStore"
+    };
+    
+    // Palavras-chave para identificar logs de execução de aplicativos
+    std::set<std::string> appExecutionKeywords = {
+        "execution", "executed", "launch", "started", "closed",
+        "opened", "runtime", "application", "app", "program",
+        "exe", "process", "task", "background", "foreground",
+        "active", "focus", "window", "instance", "pid"
+    };
+    
+    // Palavras-chave para identificar arquivos recentes abertos
+    std::set<std::string> recentFileKeywords = {
+        "recent", "recently", "opened", "accessed", "viewed",
+        "edited", "modified", "saved", "downloaded", "uploaded",
+        "quickaccess", "frequent", "popular", "favorite"
+    };
+};
+
+// ============================================================================
+// Sistema de Logging detalhado
+// ============================================================================
+class Logger {
+private:
+    std::ofstream logFile;
+    std::string logFilename;
+    bool consoleOutput;
+    std::mutex logMutex;
+    
+    std::string getTimestamp() {
+        auto now = system_clock::now();
+        auto time = system_clock::to_time_t(now);
+        std::tm tm;
+        localtime_s(&tm, &time);
+        
+        char buffer[100];
+        strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tm);
+        return std::string(buffer);
+    }
+    
+public:
+    Logger(bool console = true) : consoleOutput(console) {
+        // Criar nome do arquivo de log com timestamp
+        auto now = system_clock::now();
+        auto time = system_clock::to_time_t(now);
+        std::tm tm;
+        localtime_s(&tm, &time);
+        
+        char buffer[100];
+        strftime(buffer, sizeof(buffer), "cleaner_log_%Y%m%d_%H%M%S.txt", &tm);
+        logFilename = std::string(buffer);
+        
+        logFile.open(logFilename, std::ios::out | std::ios::app);
+        if (logFile.is_open()) {
+            logFile << "=== LOG CLEANER SESSION STARTED ===\n";
+            logFile << "Timestamp: " << getTimestamp() << "\n";
+            logFile << "====================================\n\n";
+        }
+    }
+    
+    ~Logger() {
+        if (logFile.is_open()) {
+            logFile << "\n====================================\n";
+            logFile << "Session ended: " << getTimestamp() << "\n";
+            logFile << "====================================\n";
+            logFile.close();
+        }
+    }
+    
+    void info(const std::string& message) {
+        std::lock_guard<std::mutex> lock(logMutex);
+        std::string timestamp = getTimestamp();
+        std::string logMessage = "[INFO] " + timestamp + " - " + message;
+        
+        if (logFile.is_open()) {
+            logFile << logMessage << std::endl;
+        }
+        
+        if (consoleOutput) {
+            HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+            SetConsoleTextAttribute(hConsole, 7); // Branco
+            std::cout << logMessage << std::endl;
+        }
+    }
+    
+    void success(const std::string& message) {
+        std::lock_guard<std::mutex> lock(logMutex);
+        std::string timestamp = getTimestamp();
+        std::string logMessage = "[OK] " + timestamp + " - " + message;
+        
+        if (logFile.is_open()) {
+            logFile << logMessage << std::endl;
+        }
+        
+        if (consoleOutput) {
+            HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+            SetConsoleTextAttribute(hConsole, 10); // Verde
+            std::cout << logMessage << std::endl;
+        }
+    }
+    
+    void warning(const std::string& message) {
+        std::lock_guard<std::mutex> lock(logMutex);
+        std::string timestamp = getTimestamp();
+        std::string logMessage = "[WARN] " + timestamp + " - " + message;
+        
+        if (logFile.is_open()) {
+            logFile << logMessage << std::endl;
+        }
+        
+        if (consoleOutput) {
+            HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+            SetConsoleTextAttribute(hConsole, 14); // Amarelo
+            std::cout << logMessage << std::endl;
+        }
+    }
+    
+    void error(const std::string& message) {
+        std::lock_guard<std::mutex> lock(logMutex);
+        std::string timestamp = getTimestamp();
+        std::string logMessage = "[ERROR] " + timestamp + " - " + message;
+        
+        if (logFile.is_open()) {
+            logFile << logMessage << std::endl;
+        }
+        
+        if (consoleOutput) {
+            HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+            SetConsoleTextAttribute(hConsole, 12); // Vermelho
+            std::cout << logMessage << std::endl;
+        }
+    }
+    
+    void fileRemoved(const fs::path& filePath, uintmax_t size) {
+        std::lock_guard<std::mutex> lock(logMutex);
+        std::string timestamp = getTimestamp();
+        
+        std::string sizeStr;
+        if (size < 1024) {
+            sizeStr = std::to_string(size) + " B";
+        } else if (size < 1024 * 1024) {
+            sizeStr = std::to_string(size / 1024) + " KB";
+        } else {
+            sizeStr = std::to_string(size / (1024 * 1024)) + " MB";
+        }
+        
+        std::string logMessage = "[REMOVED] " + timestamp + " - " + 
+                                  filePath.string() + " (" + sizeStr + ")";
+        
+        if (logFile.is_open()) {
+            logFile << logMessage << std::endl;
+        }
+        
+        if (consoleOutput) {
+            HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+            SetConsoleTextAttribute(hConsole, 10); // Verde
+            std::cout << logMessage << std::endl;
+        }
+    }
+    
+    void fileFailed(const fs::path& filePath, const std::string& reason) {
+        std::lock_guard<std::mutex> lock(logMutex);
+        std::string timestamp = getTimestamp();
+        std::string logMessage = "[FAILED] " + timestamp + " - " + 
+                                  filePath.string() + " - " + reason;
+        
+        if (logFile.is_open()) {
+            logFile << logMessage << std::endl;
+        }
+        
+        if (consoleOutput) {
+            HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+            SetConsoleTextAttribute(hConsole, 12); // Vermelho
+            std::cout << logMessage << std::endl;
+        }
+    }
+    
+    std::string getLogFilename() const {
+        return logFilename;
+    }
+};
+
+// ============================================================================
+// Estatísticas da limpeza
+// ============================================================================
+class CleanupStats {
+private:
+    struct CategoryStats {
+        int filesRemoved = 0;
+        uintmax_t bytesRemoved = 0;
+        int errors = 0;
+        std::map<std::string, int> extensions;
+    };
+    
+    std::map<std::string, CategoryStats> categories;
+    std::chrono::steady_clock::time_point startTime;
+    
+public:
+    CleanupStats() {
+        startTime = std::chrono::steady_clock::now();
+    }
+    
+    void addRemoved(const std::string& category, const fs::path& file, uintmax_t size) {
+        auto& stats = categories[category];
+        stats.filesRemoved++;
+        stats.bytesRemoved += size;
+        
+        std::string ext = file.extension().string();
+        if (!ext.empty()) {
+            stats.extensions[ext]++;
+        }
+    }
+    
+    void addError(const std::string& category) {
+        categories[category].errors++;
+    }
+    
+    void printSummary(Logger& logger) {
+        auto endTime = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime);
+        
+        logger.info("");
+        logger.info("╔══════════════════════════════════════════════════════════╗");
+        logger.info("║                 RESUMO DA LIMPEZA                        ║");
+        logger.info("╠══════════════════════════════════════════════════════════╣");
+        
+        int totalFiles = 0;
+        uintmax_t totalBytes = 0;
+        
+        for (const auto& [category, stats] : categories) {
+            std::string sizeStr;
+            if (stats.bytesRemoved < 1024) {
+                sizeStr = std::to_string(stats.bytesRemoved) + " B";
+            } else if (stats.bytesRemoved < 1024 * 1024) {
+                sizeStr = std::to_string(stats.bytesRemoved / 1024) + " KB";
+            } else {
+                sizeStr = std::to_string(stats.bytesRemoved / (1024 * 1024)) + " MB";
+            }
+            
+            logger.info(std::string("║ ") + 
+                       std::left + std::setw(20) + category + ": " +
+                       std::right + std::setw(6) + std::to_string(stats.filesRemoved) + " arquivos  " +
+                       std::right + std::setw(8) + sizeStr);
+            
+            totalFiles += stats.filesRemoved;
+            totalBytes += stats.bytesRemoved;
+        }
+        
+        std::string totalSizeStr;
+        if (totalBytes < 1024) {
+            totalSizeStr = std::to_string(totalBytes) + " B";
+        } else if (totalBytes < 1024 * 1024) {
+            totalSizeStr = std::to_string(totalBytes / 1024) + " KB";
+        } else {
+            totalSizeStr = std::to_string(totalBytes / (1024 * 1024)) + " MB";
+        }
+        
+        logger.info("╠══════════════════════════════════════════════════════════╣");
+        logger.info(std::string("║ TOTAL: ") + 
+                   std::right + std::setw(20) + std::to_string(totalFiles) + " arquivos  " +
+                   std::right + std::setw(8) + totalSizeStr);
+        logger.info("║");
+        logger.info(std::string("║ Tempo total: ") + std::to_string(duration.count()) + " segundos");
+        logger.info(std::string("║ Log salvo em: ") + logger.getLogFilename());
+        logger.info("╚══════════════════════════════════════════════════════════╝");
+    }
+};
+
+// ============================================================================
+// Verificador de segurança de paths
+// ============================================================================
+class PathSecurityChecker {
+private:
+    const Config& config;
+    
+    bool isPathProtected(const fs::path& path) {
+        std::string pathStr = path.string();
+        
+        // Converter para minúsculas para comparação
+        std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::tolower);
+        
+        for (const auto& protectedPath : config.protectedPaths) {
+            std::string protectedLower = protectedPath;
+            std::transform(protectedLower.begin(), protectedLower.end(), 
+                          protectedLower.begin(), ::tolower);
+            
+            if (pathStr.find(protectedLower) == 0) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    bool isExtensionBlocked(const fs::path& path) {
+        std::string ext = path.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        
+        return config.blockedExtensions.find(ext) != config.blockedExtensions.end();
+    }
+    
+    bool isExtensionAllowed(const fs::path& path) {
+        std::string ext = path.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        
+        return config.allowedExtensions.find(ext) != config.allowedExtensions.end();
+    }
+    
+public:
+    PathSecurityChecker(const Config& cfg) : config(cfg) {}
+    
+    bool isSafeToProcess(const fs::path& path, std::string& reason) {
+        // Verificar se é diretório protegido
+        if (isPathProtected(path)) {
+            reason = "Path protegido do sistema";
+            return false;
+        }
+        
+        // Se for arquivo, verificar extensões
+        if (fs::is_regular_file(path)) {
+            // Verificar extensões bloqueadas
+            if (isExtensionBlocked(path)) {
+                reason = "Extensão bloqueada por segurança";
+                return false;
+            }
+            
+            // Verificar se extensão é permitida
+            if (!isExtensionAllowed(path)) {
+                reason = "Extensão não está na lista de permitidas";
+                return false;
+            }
+            
+            // Verificar tamanho do arquivo
+            std::error_code ec;
+            uintmax_t size = fs::file_size(path, ec);
+            if (!ec && size > config.maxFileSize) {
+                reason = "Arquivo muito grande (>50MB)";
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    bool shouldDeleteFile(const fs::path& path) {
+        std::string reason;
+        return isSafeToProcess(path, reason);
+    }
+};
+
+// ============================================================================
+// Classe base para operações de limpeza modular
+// ============================================================================
+class CleanupModule {
+protected:
+    std::string name;
+    Config& config;
+    Logger& logger;
+    CleanupStats& stats;
+    PathSecurityChecker& security;
+    
+    virtual bool isTargetFile(const fs::path& filePath) = 0;
+    virtual std::vector<fs::path> getTargetDirectories() = 0;
+    
+    std::string toLower(const std::string& str) {
+        std::string result = str;
+        std::transform(result.begin(), result.end(), result.begin(), ::tolower);
+        return result;
+    }
+    
+    bool containsKeyword(const std::string& text, const std::set<std::string>& keywords) {
+        std::string lowerText = toLower(text);
+        for (const auto& keyword : keywords) {
+            if (lowerText.find(toLower(keyword)) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    void processDirectory(const fs::path& dir, int currentDepth = 0) {
+        if (currentDepth > config.maxRecursionDepth) {
+            logger.warning("Profundidade máxima atingida: " + dir.string());
+            return;
+        }
+        
+        std::error_code ec;
+        std::string reason;
+        
+        // Verificar se é seguro processar este diretório
+        if (!security.isSafeToProcess(dir, reason)) {
+            logger.warning("Pulando diretório protegido: " + dir.string() + " - " + reason);
+            return;
+        }
+        
+        try {
+            for (const auto& entry : fs::directory_iterator(dir, ec)) {
+                if (ec) {
+                    logger.error("Erro ao acessar diretório: " + ec.message());
+                    continue;
+                }
+                
+                const auto& path = entry.path();
+                
+                if (fs::is_directory(path)) {
+                    // Processar subdiretório recursivamente
+                    processDirectory(path, currentDepth + 1);
+                } 
+                else if (fs::is_regular_file(path)) {
+                    // Verificar se é arquivo alvo
+                    if (isTargetFile(path)) {
+                        // Verificação final de segurança
+                        if (security.shouldDeleteFile(path)) {
+                            deleteFile(path);
+                        } else {
+                            logger.warning("Arquivo ignorado por segurança: " + path.string());
+                        }
+                    }
+                }
+            }
+        }
+        catch (const std::exception& e) {
+            logger.error("Exceção ao processar diretório " + dir.string() + ": " + e.what());
+            stats.addError(name);
+        }
+    }
+    
+    void deleteFile(const fs::path& filePath) {
+        std::error_code ec;
+        
+        // Verificar se arquivo está em uso
+        HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, 
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   NULL, OPEN_EXISTING, 
+                                   FILE_ATTRIBUTE_NORMAL, NULL);
+        
+        if (hFile == INVALID_HANDLE_VALUE) {
+            logger.fileFailed(filePath, "Arquivo em uso ou sem permissão");
+            stats.addError(name);
+            return;
+        }
+        CloseHandle(hFile);
+        
+        // Obter tamanho para estatísticas
+        uintmax_t fileSize = fs::file_size(filePath, ec);
+        if (ec) fileSize = 0;
+        
+        // Tentar deletar
+        if (fs::remove(filePath, ec)) {
+            logger.fileRemoved(filePath, fileSize);
+            stats.addRemoved(name, filePath, fileSize);
+        } else {
+            logger.fileFailed(filePath, "Falha ao deletar: " + ec.message());
+            stats.addError(name);
+        }
+    }
+    
+public:
+    CleanupModule(const std::string& moduleName, Config& cfg, Logger& log, 
+                  CleanupStats& stat, PathSecurityChecker& sec)
+        : name(moduleName), config(cfg), logger(log), stats(stat), security(sec) {}
+    
+    virtual ~CleanupModule() = default;
+    
+    void execute() {
+        logger.info("");
+        logger.info("=== Módulo: " + name + " ===");
+        
+        auto dirs = getTargetDirectories();
+        for (const auto& dir : dirs) {
+            if (fs::exists(dir)) {
+                logger.info("Processando: " + dir.string());
+                processDirectory(dir);
+            }
+        }
+    }
+};
+
+// ============================================================================
+// Módulo: Logs de Execução de Aplicativos
+// ============================================================================
+class AppExecutionLogsModule : public CleanupModule {
+protected:
+    bool isTargetFile(const fs::path& filePath) override {
+        std::string filename = filePath.filename().string();
+        std::string ext = filePath.extension().string();
+        
+        // Verificar extensão primeiro
+        if (ext != ".log" && ext != ".txt" && ext != ".dat" && 
+            ext != ".etl" && ext != ".evtx") {
+            return false;
+        }
+        
+        // Verificar conteúdo do nome do arquivo
+        return containsKeyword(filename, config.appExecutionKeywords);
+    }
+    
+    std::vector<fs::path> getTargetDirectories() override {
+        std::vector<fs::path> dirs;
+        
+        // Obter caminho do usuário
+        wchar_t userPath[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, userPath))) {
+            std::wstring base = userPath;
+            
+            // Logs de execução de aplicativos
+            dirs.push_back(base + L"\\AppData\\Local\\Microsoft\\Windows\\Application Shortcuts");
+            dirs.push_back(base + L"\\AppData\\Local\\Microsoft\\Windows\\Caches");
+            dirs.push_back(base + L"\\AppData\\Local\\Microsoft\\Windows\\Explorer");
+            dirs.push_back(base + L"\\AppData\\Local\\Microsoft\\Windows\\WER");
+            dirs.push_back(base + L"\\AppData\\Local\\Temp");
+            dirs.push_back(L"C:\\Windows\\Logs\\Application");
+            dirs.push_back(L"C:\\Windows\\Logs\\WindowsUpdate");
+        }
+        
+        return dirs;
+    }
+    
+public:
+    AppExecutionLogsModule(Config& cfg, Logger& log, CleanupStats& stat, PathSecurityChecker& sec)
+        : CleanupModule("Logs de Execução", cfg, log, stat, sec) {}
+};
+
+// ============================================================================
+// Módulo: Documentos Recentes e Arquivos Abertos
+// ============================================================================
+class RecentFilesModule : public CleanupModule {
+protected:
+    bool isTargetFile(const fs::path& filePath) override {
+        std::string filename = filePath.filename().string();
+        std::string ext = filePath.extension().string();
+        
+        // Atalhos .lnk na pasta Recent
+        if (ext == ".lnk" || ext == ".url") {
+            return true;
+        }
+        
+        // Arquivos com keywords de recentes
+        if (containsKeyword(filename, config.recentFileKeywords)) {
+            return (ext == ".log" || ext == ".txt" || ext == ".dat");
+        }
+        
+        return false;
+    }
+    
+    std::vector<fs::path> getTargetDirectories() override {
+        std::vector<fs::path> dirs;
+        
+        wchar_t recentPath[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_RECENT, NULL, 0, recentPath))) {
+            dirs.push_back(recentPath);
+        }
+        
+        wchar_t userPath[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, userPath))) {
+            std::wstring base = userPath;
+            dirs.push_back(base + L"\\AppData\\Roaming\\Microsoft\\Windows\\Recent");
+            dirs.push_back(base + L"\\AppData\\Roaming\\Microsoft\\Windows\\Recent Documents");
+            dirs.push_back(base + L"\\AppData\\Local\\Microsoft\\Windows\\Recent Items");
+        }
+        
+        return dirs;
+    }
+    
+public:
+    RecentFilesModule(Config& cfg, Logger& log, CleanupStats& stat, PathSecurityChecker& sec)
+        : CleanupModule("Documentos Recentes", cfg, log, stat, sec) {}
+    
+    void execute() override {
+        CleanupModule::execute();
+        
+        // Limpar lista de recentes do sistema
+        SHAddToRecentDocs(SHARD_PATHW, NULL);
+        logger.success("Lista de documentos recentes do sistema limpa");
+    }
+};
+
+// ============================================================================
+// Módulo: Logs de Dispositivos USB
+// ============================================================================
+class USBLogsModule : public CleanupModule {
+protected:
+    bool isTargetFile(const fs::path& filePath) override {
+        std::string filename = filePath.filename().string();
+        std::string ext = filePath.extension().string();
+        
+        // Logs de USB específicos
+        return (filename.find("usb") != std::string::npos ||
+                filename.find("USB") != std::string::npos ||
+                filename.find("drive") != std::string::npos ||
+                filename.find("Drive") != std::string::npos ||
+                filename.find("removable") != std::string::npos) &&
+               (ext == ".log" || ext == ".txt" || ext == ".dat");
+    }
+    
+    std::vector<fs::path> getTargetDirectories() override {
+        std::vector<fs::path> dirs;
+        
+        wchar_t userPath[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, userPath))) {
+            std::wstring base = userPath;
+            dirs.push_back(base + L"\\AppData\\Local\\Microsoft\\Windows\\ConnectedDevicesPlatform");
+            dirs.push_back(base + L"\\AppData\\Local\\Microsoft\\Windows\\DeviceMetadataStore");
+        }
+        
+        dirs.push_back(L"C:\\Windows\\INF");
+        dirs.push_back(L"C:\\Windows\\Logs\\USB");
+        
+        return dirs;
+    }
+    
+public:
+    USBLogsModule(Config& cfg, Logger& log, CleanupStats& stat, PathSecurityChecker& sec)
+        : CleanupModule("Logs USB", cfg, log, stat, sec) {}
+    
+    void execute() override {
+        CleanupModule::execute();
+        
+        // Apenas verificar USBSTOR (modo leitura)
+        HKEY hKey;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, 
+                          L"SYSTEM\\CurrentControlSet\\Enum\\USBSTOR", 
+                          0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            logger.info("Registros USB identificados (modo leitura)");
+            RegCloseKey(hKey);
+        }
+    }
+};
+
+// ============================================================================
+// Módulo: Logs de Download e Navegadores
+// ============================================================================
+class DownloadLogsModule : public CleanupModule {
+protected:
+    bool isTargetFile(const fs::path& filePath) override {
+        std::string filename = filePath.filename().string();
+        std::string ext = filePath.extension().string();
+        
+        // Downloads em andamento
+        if (ext == ".crdownload" || ext == ".part") {
+            return true;
+        }
+        
+        // Histórico de download dos navegadores
+        if (filename == "downloads.sqlite" || 
+            filename == "Download History" ||
+            filename.find("download") != std::string::npos) {
+            return true;
+        }
+        
+        return false;
+    }
+    
+    std::vector<fs::path> getTargetDirectories() override {
+        std::vector<fs::path> dirs;
+        
+        wchar_t userPath[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, userPath))) {
+            std::wstring base = userPath;
+            
+            // Navegadores
+            dirs.push_back(base + L"\\AppData\\Local\\Google\\Chrome\\User Data\\Default");
+            dirs.push_back(base + L"\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default");
+            dirs.push_back(base + L"\\AppData\\Local\\BraveSoftware\\Brave-Browser\\User Data\\Default");
+            dirs.push_back(base + L"\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles");
+            
+            // Downloads folder
+            dirs.push_back(base + L"\\Downloads");
+        }
+        
+        return dirs;
+    }
+    
+public:
+    DownloadLogsModule(Config& cfg, Logger& log, CleanupStats& stat, PathSecurityChecker& sec)
+        : CleanupModule("Logs de Download", cfg, log, stat, sec) {}
+};
+
+// ============================================================================
+// Classe principal da aplicação
+// ============================================================================
+class Application {
+private:
+    Config config;
+    Logger logger;
+    CleanupStats stats;
+    PathSecurityChecker security;
+    std::vector<std::unique_ptr<CleanupModule>> modules;
+    
+    bool isRunningAsAdmin() {
+        BOOL isAdmin = FALSE;
+        PSID adminGroup = NULL;
+        SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+        
+        if (AllocateAndInitializeSid(&ntAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                      DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+            CheckTokenMembership(NULL, adminGroup, &isAdmin);
+            FreeSid(adminGroup);
+        }
+        
+        return isAdmin == TRUE;
+    }
+    
+    void showBanner() {
+        logger.info("");
+        logger.info("╔══════════════════════════════════════════════════════════╗");
+        logger.info("║           PRIVACY LOG CLEANER v4.0 - REAL MODE           ║");
+        logger.info("╠══════════════════════════════════════════════════════════╣");
+        logger.info("║  Removendo logs de atividade do usuário com segurança    ║");
+        logger.info("║                                                          ║");
+        logger.info("║  Módulos ativos:                                         ║");
+        logger.info("║  • Logs de Execução de Aplicativos                       ║");
+        logger.info("║  • Documentos Recentes e Arquivos Abertos                ║");
+        logger.info("║  • Logs de Dispositivos USB                              ║");
+        logger.info("║  • Logs de Download e Navegadores                        ║");
+        logger.info("╚══════════════════════════════════════════════════════════╝");
+        
+        if (!isRunningAsAdmin()) {
+            logger.warning("⚠  Execute como Administrador para melhores resultados!");
+        }
+        
+        logger.info("");
+        logger.info("Iniciando limpeza em 3 segundos...");
+        Sleep(3000);
+    }
+    
+    void initializeModules() {
+        modules.push_back(std::make_unique<AppExecutionLogsModule>(config, logger, stats, security));
+        modules.push_back(std::make_unique<RecentFilesModule>(config, logger, stats, security));
+        modules.push_back(std::make_unique<USBLogsModule>(config, logger, stats, security));
+        modules.push_back(std::make_unique<DownloadLogsModule>(config, logger, stats, security));
+    }
+    
+public:
+    Application() : logger(true), security(config) {}
+    
+    int run() {
+        // Configurar console
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+        SetConsoleTitleW(L"Privacy Log Cleaner v4.0");
+        
+        // Esconder cursor
+        HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+        CONSOLE_CURSOR_INFO cursorInfo;
+        GetConsoleCursorInfo(hConsole, &cursorInfo);
+        cursorInfo.bVisible = false;
+        SetConsoleCursorInfo(hConsole, &cursorInfo);
+        
+        showBanner();
+        
+        initializeModules();
+        
+        logger.info("");
+        logger.info("▶ INICIANDO LIMPEZA REAL...");
+        
+        // Executar cada módulo
+        for (const auto& module : modules) {
+            module->execute();
+        }
+        
+        // Mostrar resumo
+        stats.printSummary(logger);
+        
+        logger.info("");
+        logger.info("✅ Limpeza concluída! A janela fechará em 10 segundos...");
+        Sleep(10000);
+        
+        return 0;
+    }
+};
+
+// ============================================================================
+// Ponto de entrada
+// ============================================================================
+int main() {
+    try {
+        Application app;
+        return app.run();
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Erro fatal: " << e.what() << std::endl;
+        return 1;
+    }
+}
